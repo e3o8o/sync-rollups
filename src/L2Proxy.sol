@@ -96,7 +96,9 @@ contract L2Proxy {
             destination: _getOriginalAddress(),
             value: msg.value,
             data: msg.data,
-            failed: false
+            failed: false,
+            sourceAddress: address(this),
+            sourceRollup: rollupId
         });
 
         // Compute action hash
@@ -114,6 +116,27 @@ contract L2Proxy {
     /// @notice Allows the proxy to receive ETH
     receive() external payable {}
 
+    /// @notice Executes a call on behalf of another authorized proxy
+    /// @dev Only callable by other authorized proxies
+    /// @param destination The address to call
+    /// @param data The calldata
+    /// @return success Whether the call succeeded
+    /// @return returnData The return data from the call
+    function executeOnBehalf(
+        address destination,
+        bytes calldata data
+    ) external payable returns (bool success, bytes memory returnData) {
+        Rollups rollupsContract = _getRollups();
+
+        // Only authorized proxies can call this
+        if (!rollupsContract.authorizedProxies(msg.sender)) {
+            revert Unauthorized();
+        }
+
+        // Execute the call from this proxy using msg.value
+        (success, returnData) = destination.call{value: msg.value}(data);
+    }
+
     /// @notice Internal function to execute an L2 action through the Rollups contract
     /// @param actionHash The action hash to execute
     /// @param rollupsContract The Rollups contract instance
@@ -126,13 +149,26 @@ contract L2Proxy {
             Action memory nextAction = rollupsContract.executeL2Execution(currentActionHash);
 
             if (nextAction.actionType == ActionType.CALL) {
+                // Compute source proxy address
+                address sourceProxy = rollupsContract.computeL2ProxyAddress(
+                    nextAction.sourceAddress,
+                    nextAction.sourceRollup,
+                    block.chainid
+                );
+
+                // Create source proxy if it doesn't exist
+                if (!rollupsContract.authorizedProxies(sourceProxy)) {
+                    rollupsContract.createL2ProxyContract(nextAction.sourceAddress, nextAction.sourceRollup);
+                }
+
                 // Withdraw ETH from rollup if needed for the call
                 if (nextAction.value > 0) {
                     rollupsContract.withdrawEther(rollupId, nextAction.value);
                 }
 
-                // Execute the call
-                (bool success, bytes memory returnData) = nextAction.destination.call{value: nextAction.value}(
+                // Execute the call through the source proxy
+                (bool success, bytes memory returnData) = L2Proxy(payable(sourceProxy)).executeOnBehalf{value: nextAction.value}(
+                    nextAction.destination,
                     nextAction.data
                 );
 
@@ -143,7 +179,9 @@ contract L2Proxy {
                     destination: address(0),
                     value: 0,
                     data: returnData,
-                    failed: !success
+                    failed: !success,
+                    sourceAddress: address(0),
+                    sourceRollup: 0
                 });
 
                 // Compute new action hash and continue the loop

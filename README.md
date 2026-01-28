@@ -45,12 +45,14 @@ struct StateDelta {
 }
 
 struct Action {
-    ActionType actionType;  // CALL or RESULT
+    ActionType actionType;  // CALL, RESULT, or L2TX
     uint256 rollupId;
-    address destination;
-    uint256 value;
-    bytes data;
-    bool failed;
+    address destination;    // for CALL
+    uint256 value;          // for CALL
+    bytes data;             // callData/returnData/rlpEncodedTx
+    bool failed;            // for RESULT
+    address sourceAddress;  // for CALL - immediate caller address
+    uint256 sourceRollup;   // for CALL - immediate caller's rollup ID
 }
 
 struct StateCommitment {
@@ -177,6 +179,7 @@ address proxyAddr = rollups.computeL2ProxyAddress(
 | `postBatch()` | Posts batch of state commitments with ZK proof (async path) |
 | `loadL2Executions()` | Loads pre-computed executions with ZK proof |
 | `executeL2Execution()` | Executes pre-loaded execution (only callable by authorized proxies) |
+| `executeL2TX()` | Executes an L2 transaction (permissionless) |
 | `depositEther()` | Deposits ETH to a rollup's balance |
 | `withdrawEther()` | Withdraws ETH from a rollup's balance (authorized proxies only) |
 | `computeL2ProxyAddress()` | Computes deterministic proxy address |
@@ -198,7 +201,8 @@ publicInputs = hash(0x01, executionHashes[])
 
 ## Security Considerations
 
-- Only authorized proxies can execute L2 executions and withdraw ETH
+- Only authorized proxies can execute L2 executions via `executeL2Execution()` and withdraw ETH
+- `executeL2TX()` is permissionless - anyone can trigger pre-loaded L2 transactions
 - Same-block protection prevents conflicts between async and sync state updates
 - All state transitions are verified with ZK proofs
 - Rollup owners can update verification keys and transfer ownership

@@ -8,12 +8,14 @@ import {Proxy} from "./Proxy.sol";
 /// @notice Action type enum
 enum ActionType {
     CALL,
-    RESULT
+    RESULT,
+    L2TX
 }
 
 /// @notice Represents an action in the state transition
-/// @dev For CALL: rollupId, destination, value, and data (callData) are used
+/// @dev For CALL: rollupId, destination, value, data (callData), sourceAddress, and sourceRollup are used
 /// @dev For RESULT: failed and data (returnData) are used
+/// @dev For L2TX: rollupId and data (rlpEncodedTx) are used
 struct Action {
     ActionType actionType;
     uint256 rollupId;
@@ -21,6 +23,8 @@ struct Action {
     uint256 value;
     bytes data;
     bool failed;
+    address sourceAddress;
+    uint256 sourceRollup;
 }
 
 /// @notice Represents a state delta for a single rollup (before/after snapshot)
@@ -126,6 +130,9 @@ contract Rollups {
     /// @notice Error when ether transfer fails
     error EtherTransferFailed();
 
+    /// @notice Error when a call execution fails
+    error CallExecutionFailed();
+
     /// @param _zkVerifier The ZK verifier contract address
     /// @param startingRollupId The starting ID for rollup numbering
     constructor(address _zkVerifier, uint256 startingRollupId) {
@@ -159,13 +166,7 @@ contract Rollups {
     /// @param originalRollupId The original rollup ID
     /// @return proxy The address of the deployed Proxy
     function createL2ProxyContract(address originalAddress, uint256 originalRollupId) external returns (address proxy) {
-        bytes32 salt = keccak256(abi.encodePacked(block.chainid, originalRollupId, originalAddress));
-
-        proxy = address(new Proxy{salt: salt}(l2ProxyImplementation, address(this), originalAddress, originalRollupId));
-
-        authorizedProxies[proxy] = true;
-
-        emit L2ProxyCreated(proxy, originalAddress, originalRollupId);
+        return _createL2ProxyContractInternal(originalAddress, originalRollupId);
     }
 
     /// @notice Modifier to check if caller is the rollup owner
@@ -329,7 +330,13 @@ contract Rollups {
         if (!authorizedProxies[msg.sender]) {
             revert UnauthorizedProxy();
         }
+        return _findAndApplyExecution(actionHash);
+    }
 
+    /// @notice Internal function to find and apply an execution
+    /// @param actionHash The action hash to look up
+    /// @return nextAction The next action to perform
+    function _findAndApplyExecution(bytes32 actionHash) internal returns (Action memory nextAction) {
         // Look up executions array
         Execution[] storage executions = _executions[actionHash];
 
@@ -386,6 +393,96 @@ contract Rollups {
         }
 
         revert ExecutionNotFound();
+    }
+
+    /// @notice Executes an L2 transaction
+    /// @param rollupId The rollup ID for the transaction
+    /// @param rlpEncodedTx The RLP-encoded transaction data
+    /// @return result The result data from the execution
+    function executeL2TX(uint256 rollupId, bytes calldata rlpEncodedTx) external returns (bytes memory result) {
+        // Build the L2TX action
+        Action memory action = Action({
+            actionType: ActionType.L2TX,
+            rollupId: rollupId,
+            destination: address(0),
+            value: 0,
+            data: rlpEncodedTx,
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
+        });
+
+        // Compute action hash and get first nextAction
+        bytes32 currentActionHash = keccak256(abi.encode(action));
+        Action memory nextAction = _findAndApplyExecution(currentActionHash);
+
+        // Process actions in a loop until we get a RESULT
+        while (true) {
+            if (nextAction.actionType == ActionType.CALL) {
+                // Compute source proxy address
+                address sourceProxy = this.computeL2ProxyAddress(
+                    nextAction.sourceAddress,
+                    nextAction.sourceRollup,
+                    block.chainid
+                );
+
+                // Create source proxy if it doesn't exist
+                if (!authorizedProxies[sourceProxy]) {
+                    _createL2ProxyContractInternal(nextAction.sourceAddress, nextAction.sourceRollup);
+                }
+
+                // Withdraw ETH from rollup if needed for the call
+                if (nextAction.value > 0) {
+                    RollupConfig storage config = rollups[nextAction.sourceRollup];
+                    if (config.etherBalance < nextAction.value) {
+                        revert InsufficientRollupBalance();
+                    }
+                    config.etherBalance -= nextAction.value;
+                }
+
+                // Execute the call through the source proxy (ETH is sent directly from Rollups contract)
+                (bool success, bytes memory returnData) = L2Proxy(payable(sourceProxy)).executeOnBehalf{value: nextAction.value}(
+                    nextAction.destination,
+                    nextAction.data
+                );
+
+                // Build RESULT action from the call result
+                Action memory resultAction = Action({
+                    actionType: ActionType.RESULT,
+                    rollupId: nextAction.rollupId,
+                    destination: address(0),
+                    value: 0,
+                    data: returnData,
+                    failed: !success,
+                    sourceAddress: address(0),
+                    sourceRollup: 0
+                });
+
+                // Compute new action hash and get next action
+                currentActionHash = keccak256(abi.encode(resultAction));
+                nextAction = _findAndApplyExecution(currentActionHash);
+            } else {
+                // RESULT type - return the data or revert if failed
+                if (nextAction.failed) {
+                    revert CallExecutionFailed();
+                }
+                return nextAction.data;
+            }
+        }
+    }
+
+    /// @notice Internal function to create an L2Proxy contract
+    /// @param originalAddress The original address this proxy represents
+    /// @param originalRollupId The original rollup ID
+    /// @return proxy The address of the deployed Proxy
+    function _createL2ProxyContractInternal(address originalAddress, uint256 originalRollupId) internal returns (address proxy) {
+        bytes32 salt = keccak256(abi.encodePacked(block.chainid, originalRollupId, originalAddress));
+
+        proxy = address(new Proxy{salt: salt}(l2ProxyImplementation, address(this), originalAddress, originalRollupId));
+
+        authorizedProxies[proxy] = true;
+
+        emit L2ProxyCreated(proxy, originalAddress, originalRollupId);
     }
 
     /// @notice Deposits ether to a rollup's balance

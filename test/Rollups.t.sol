@@ -196,7 +196,9 @@ contract RollupsTest is Test {
             destination: address(target),
             value: 0,
             data: callData,
-            failed: false
+            failed: false,
+            sourceAddress: proxyAddr,
+            sourceRollup: rollupId
         });
 
         Action memory nextAction = Action({
@@ -205,7 +207,9 @@ contract RollupsTest is Test {
             destination: address(0),
             value: 0,
             data: "",
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // Create state deltas array
@@ -308,6 +312,9 @@ contract RollupsTest is Test {
     function test_LoadL2Executions() public {
         uint256 rollupId = rollups.createRollup(bytes32(0), DEFAULT_VK, alice);
 
+        // Compute proxy address first (needed for action hash)
+        address proxyAddr = rollups.computeL2ProxyAddress(address(target), rollupId, block.chainid);
+
         bytes32 currentState = bytes32(0);
         bytes32 newState = keccak256("state1");
 
@@ -319,7 +326,9 @@ contract RollupsTest is Test {
             destination: address(target),
             value: 0,
             data: callData,
-            failed: false
+            failed: false,
+            sourceAddress: proxyAddr,
+            sourceRollup: rollupId
         });
 
         Action memory nextAction = Action({
@@ -328,7 +337,9 @@ contract RollupsTest is Test {
             destination: address(0),
             value: 0,
             data: "",
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // Create state deltas array
@@ -347,8 +358,9 @@ contract RollupsTest is Test {
 
         rollups.loadL2Executions(executions, "proof");
 
-        // Verify execution works by executing it via proxy fallback
-        address proxyAddr = rollups.createL2ProxyContract(address(target), rollupId);
+        // Create and verify execution works via proxy fallback
+        address actualProxyAddr = rollups.createL2ProxyContract(address(target), rollupId);
+        assertEq(proxyAddr, actualProxyAddr); // Verify computed address matches
         (bool success,) = proxyAddr.call(callData);
         assertTrue(success);
 
@@ -381,7 +393,9 @@ contract RollupsTest is Test {
             destination: address(target),
             value: 0,
             data: callData,
-            failed: false
+            failed: false,
+            sourceAddress: proxyAddr,
+            sourceRollup: rollupId
         });
 
         Action memory nextAction = Action({
@@ -390,7 +404,9 @@ contract RollupsTest is Test {
             destination: address(0),
             value: 0,
             data: "",
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // Create state deltas array
@@ -459,7 +475,9 @@ contract RollupsTest is Test {
             destination: address(target),
             value: 0,
             data: callData,
-            failed: false
+            failed: false,
+            sourceAddress: proxyAddr,
+            sourceRollup: rollupId
         });
 
         // Next action after first CALL: another CALL to setValue(200)
@@ -469,7 +487,9 @@ contract RollupsTest is Test {
             destination: address(target),
             value: 0,
             data: abi.encodeCall(TestTarget.setValue, (200)),
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // Result action from the second CALL (setValue returns nothing, so empty data)
@@ -479,7 +499,9 @@ contract RollupsTest is Test {
             destination: address(0),
             value: 0,
             data: "",
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // Final result action
@@ -489,7 +511,9 @@ contract RollupsTest is Test {
             destination: address(0),
             value: 0,
             data: "",
-            failed: false
+            failed: false,
+            sourceAddress: address(0),
+            sourceRollup: 0
         });
 
         // State deltas for first execution

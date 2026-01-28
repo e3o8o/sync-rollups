@@ -24,15 +24,17 @@ forge fmt            # Format code
 ### Data Types
 
 ```solidity
-enum ActionType { CALL, RESULT }
+enum ActionType { CALL, RESULT, L2TX }
 
 struct Action {
     ActionType actionType;
     uint256 rollupId;
     address destination;    // for CALL
     uint256 value;          // for CALL
-    bytes data;             // callData for CALL, returnData for RESULT
+    bytes data;             // callData for CALL, returnData for RESULT, rlpEncodedTx for L2TX
     bool failed;            // for RESULT
+    address sourceAddress;  // for CALL - immediate caller address
+    uint256 sourceRollup;   // for CALL - immediate caller's rollup ID
 }
 
 struct StateDelta {
@@ -72,8 +74,9 @@ struct RollupConfig {
 6. **transferRollupOwnership(rollupId, newOwner)**: Transfers rollup ownership (owner only)
 7. **loadL2Executions(executions, proof)**: Loads pre-computed executions with ZK proof
 8. **executeL2Execution(actionHash)**: Executes pre-loaded execution (only callable by authorized proxies)
-9. **depositEther(rollupId)**: Deposits ETH to a rollup's balance
-10. **withdrawEther(rollupId, amount)**: Withdraws ETH from a rollup's balance (only callable by authorized proxies)
+9. **executeL2TX(rollupId, rlpEncodedTx)**: Executes an L2 transaction (permissionless)
+10. **depositEther(rollupId)**: Deposits ETH to a rollup's balance
+11. **withdrawEther(rollupId, amount)**: Withdraws ETH from a rollup's balance (only callable by authorized proxies)
 
 ### Execution Flow
 
