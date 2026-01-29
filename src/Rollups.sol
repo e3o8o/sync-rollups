@@ -9,11 +9,13 @@ import {Proxy} from "./Proxy.sol";
 enum ActionType {
     CALL,
     RESULT,
-    L2TX
+    L2TX,
+    REVERT,
+    REVERT_CONTINUE
 }
 
 /// @notice Represents an action in the state transition
-/// @dev For CALL: rollupId, destination, value, data (callData), sourceAddress, and sourceRollup are used
+/// @dev For CALL: rollupId, destination, value, data (callData), sourceAddress, sourceRollup, and scope are used
 /// @dev For RESULT: failed and data (returnData) are used
 /// @dev For L2TX: rollupId and data (rlpEncodedTx) are used
 struct Action {
@@ -25,6 +27,7 @@ struct Action {
     bool failed;
     address sourceAddress;
     uint256 sourceRollup;
+    uint256[] scope;
 }
 
 /// @notice Represents a state delta for a single rollup (before/after snapshot)
@@ -132,6 +135,12 @@ contract Rollups {
 
     /// @notice Error when a call execution fails
     error CallExecutionFailed();
+
+    /// @notice Error when a scope reverts, carrying the next action to continue with
+    /// @param nextAction The ABI-encoded next action to continue with
+    /// @param stateRoot The state root to restore when catching the revert
+    /// @param rollupId The rollup ID whose state to restore
+    error ScopeReverted(bytes nextAction, bytes32 stateRoot, uint256 rollupId);
 
     /// @param _zkVerifier The ZK verifier contract address
     /// @param startingRollupId The starting ID for rollup numbering
@@ -395,6 +404,115 @@ contract Rollups {
         revert ExecutionNotFound();
     }
 
+    /// @notice Processes a scoped CALL action by navigating to the correct scope level
+    /// @param scope The current scope level we are at
+    /// @param action The CALL action to process (action.scope contains target scope)
+    /// @return nextAction The next action to process
+    function newScope(
+        uint256[] memory scope,
+        Action memory action
+    ) external returns (Action memory nextAction) {
+        // Only Rollups contract (self) or authorized proxies can call
+        if (msg.sender != address(this) && !authorizedProxies[msg.sender]) {
+            revert UnauthorizedProxy();
+        }
+
+        nextAction = action;
+
+        while (true) {
+            if (nextAction.actionType == ActionType.CALL) {
+                if (_isChildScope(scope, nextAction.scope)) {
+                    // Target is deeper - navigate by appending next element
+                    uint256[] memory newScopeArr = _appendToScope(scope, nextAction.scope[scope.length]);
+
+                    // Use try/catch for recursive call to handle reverts from child scopes
+                    try this.newScope(newScopeArr, nextAction) returns (Action memory retAction) {
+                        nextAction = retAction;
+                    } catch (bytes memory revertData) {
+                        nextAction = _handleScopeRevert(revertData);
+                    }
+                } else if (_scopesMatch(scope, nextAction.scope)) {
+                    // At target scope - execute the call
+                    (, nextAction) = _processCallAtScope(scope, nextAction);
+                } else {
+                    // Action is at a parent/sibling scope - return to caller
+                    break;
+                }
+            } else if (nextAction.actionType == ActionType.REVERT) {
+                if (_scopesMatch(scope, nextAction.scope)) {
+                    // This is the target revert scope - capture state and revert
+                    uint256 rollupId = nextAction.rollupId;
+                    bytes32 stateRoot = rollups[rollupId].stateRoot;
+                    Action memory continuation = _getRevertContinuation(rollupId);
+                    revert ScopeReverted(abi.encode(continuation), stateRoot, rollupId);
+                } else {
+                    // Revert is for parent/sibling scope - return to caller
+                    break;
+                }
+            } else {
+                // RESULT or other action type - return to caller
+                break;
+            }
+        }
+
+        return nextAction;
+    }
+
+    /// @notice Executes a single CALL at the current scope and returns the next action
+    /// @dev Does NOT loop - returns immediately after getting nextAction
+    /// @dev Looping for same-scope calls is handled by newScope
+    /// @param currentScope The current scope level
+    /// @param action The CALL action to execute
+    /// @return scope The scope after processing (always currentScope)
+    /// @return nextAction The next action (RESULT or CALL at any scope)
+    function _processCallAtScope(
+        uint256[] memory currentScope,
+        Action memory action
+    ) internal returns (uint256[] memory scope, Action memory nextAction) {
+        // Execute the CALL through source proxy
+        address sourceProxy = this.computeL2ProxyAddress(
+            action.sourceAddress,
+            action.sourceRollup,
+            block.chainid
+        );
+
+        if (!authorizedProxies[sourceProxy]) {
+            _createL2ProxyContractInternal(action.sourceAddress, action.sourceRollup);
+        }
+
+        if (action.value > 0) {
+            RollupConfig storage config = rollups[action.sourceRollup];
+            if (config.etherBalance < action.value) {
+                revert InsufficientRollupBalance();
+            }
+            config.etherBalance -= action.value;
+        }
+
+        (bool success, bytes memory returnData) = L2Proxy(payable(sourceProxy)).executeOnBehalf{value: action.value}(
+            action.destination,
+            action.data
+        );
+
+        // Build RESULT action
+        Action memory resultAction = Action({
+            actionType: ActionType.RESULT,
+            rollupId: action.rollupId,
+            destination: address(0),
+            value: 0,
+            data: returnData,
+            failed: !success,
+            sourceAddress: address(0),
+            sourceRollup: 0,
+            scope: new uint256[](0)
+        });
+
+        // Get next action from execution lookup
+        bytes32 resultHash = keccak256(abi.encode(resultAction));
+        nextAction = _findAndApplyExecution(resultHash);
+
+        return (currentScope, nextAction);
+    }
+
     /// @notice Executes an L2 transaction
     /// @param rollupId The rollup ID for the transaction
     /// @param rlpEncodedTx The RLP-encoded transaction data
@@ -409,66 +527,31 @@ contract Rollups {
             data: rlpEncodedTx,
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Compute action hash and get first nextAction
         bytes32 currentActionHash = keccak256(abi.encode(action));
         Action memory nextAction = _findAndApplyExecution(currentActionHash);
 
-        // Process actions in a loop until we get a RESULT
-        while (true) {
-            if (nextAction.actionType == ActionType.CALL) {
-                // Compute source proxy address
-                address sourceProxy = this.computeL2ProxyAddress(
-                    nextAction.sourceAddress,
-                    nextAction.sourceRollup,
-                    block.chainid
-                );
-
-                // Create source proxy if it doesn't exist
-                if (!authorizedProxies[sourceProxy]) {
-                    _createL2ProxyContractInternal(nextAction.sourceAddress, nextAction.sourceRollup);
-                }
-
-                // Withdraw ETH from rollup if needed for the call
-                if (nextAction.value > 0) {
-                    RollupConfig storage config = rollups[nextAction.sourceRollup];
-                    if (config.etherBalance < nextAction.value) {
-                        revert InsufficientRollupBalance();
-                    }
-                    config.etherBalance -= nextAction.value;
-                }
-
-                // Execute the call through the source proxy (ETH is sent directly from Rollups contract)
-                (bool success, bytes memory returnData) = L2Proxy(payable(sourceProxy)).executeOnBehalf{value: nextAction.value}(
-                    nextAction.destination,
-                    nextAction.data
-                );
-
-                // Build RESULT action from the call result
-                Action memory resultAction = Action({
-                    actionType: ActionType.RESULT,
-                    rollupId: nextAction.rollupId,
-                    destination: address(0),
-                    value: 0,
-                    data: returnData,
-                    failed: !success,
-                    sourceAddress: address(0),
-                    sourceRollup: 0
-                });
-
-                // Compute new action hash and get next action
-                currentActionHash = keccak256(abi.encode(resultAction));
-                nextAction = _findAndApplyExecution(currentActionHash);
-            } else {
-                // RESULT type - return the data or revert if failed
-                if (nextAction.failed) {
-                    revert CallExecutionFailed();
-                }
-                return nextAction.data;
+        if (nextAction.actionType == ActionType.CALL) {
+            // Delegate all scope handling to newScope with try/catch for reverts
+            // Start with empty scope, action.scope contains target
+            uint256[] memory emptyScope = new uint256[](0);
+            try this.newScope(emptyScope, nextAction) returns (Action memory retAction) {
+                nextAction = retAction;
+            } catch (bytes memory revertData) {
+                // Root scope caught a revert - decode and continue
+                nextAction = _handleScopeRevert(revertData);
             }
         }
+
+        // At this point nextAction should be a successful RESULT
+        if (nextAction.actionType != ActionType.RESULT || nextAction.failed) {
+            revert CallExecutionFailed();
+        }
+        return nextAction.data;
     }
 
     /// @notice Internal function to create an L2Proxy contract
@@ -507,6 +590,84 @@ contract Rollups {
         if (!success) {
             revert EtherTransferFailed();
         }
+    }
+
+    /// @notice Appends an element to a scope array
+    /// @param scope The original scope array
+    /// @param element The element to append
+    /// @return The new scope array with the element appended
+    function _appendToScope(uint256[] memory scope, uint256 element) internal pure returns (uint256[] memory) {
+        uint256[] memory result = new uint256[](scope.length + 1);
+        for (uint256 i = 0; i < scope.length; i++) {
+            result[i] = scope[i];
+        }
+        result[scope.length] = element;
+        return result;
+    }
+
+    /// @notice Checks if two scopes match exactly
+    /// @param a First scope array
+    /// @param b Second scope array
+    /// @return True if scopes match exactly
+    function _scopesMatch(uint256[] memory a, uint256[] memory b) internal pure returns (bool) {
+        if (a.length != b.length) return false;
+        for (uint256 i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
+    /// @notice Checks if targetScope is a child of currentScope (starts with currentScope prefix and is longer)
+    /// @param currentScope The current scope to check against
+    /// @param targetScope The target scope to check
+    /// @return True if targetScope is a child of currentScope
+    function _isChildScope(uint256[] memory currentScope, uint256[] memory targetScope) internal pure returns (bool) {
+        if (targetScope.length <= currentScope.length) return false;
+        for (uint256 i = 0; i < currentScope.length; i++) {
+            if (currentScope[i] != targetScope[i]) return false;
+        }
+        return true;
+    }
+
+    /// @notice Handles a ScopeReverted exception by decoding the action and restoring rollup state
+    /// @param revertData The raw revert data (includes 4-byte selector)
+    /// @return nextAction The decoded continuation action
+    function _handleScopeRevert(bytes memory revertData) internal returns (Action memory nextAction) {
+        // Skip 4-byte selector, decode parameters
+        require(revertData.length > 4, "Invalid revert data");
+        bytes memory withoutSelector = new bytes(revertData.length - 4);
+        for (uint256 i = 4; i < revertData.length; i++) {
+            withoutSelector[i - 4] = revertData[i];
+        }
+        // Decode: (bytes nextAction, bytes32 stateRoot, uint256 rollupId)
+        (bytes memory actionBytes, bytes32 stateRoot, uint256 rollupId) = abi.decode(withoutSelector, (bytes, bytes32, uint256));
+
+        // Restore state root
+        rollups[rollupId].stateRoot = stateRoot;
+
+        return abi.decode(actionBytes, (Action));
+    }
+
+    /// @notice Gets the continuation action after a revert at the current scope
+    /// @param rollupId The rollup ID for the REVERT_CONTINUE action
+    /// @return nextAction The next action from REVERT_CONTINUE lookup
+    function _getRevertContinuation(uint256 rollupId) internal returns (Action memory nextAction) {
+        // Build REVERT_CONTINUE action (empty data)
+        Action memory revertContinueAction = Action({
+            actionType: ActionType.REVERT_CONTINUE,
+            rollupId: rollupId,
+            destination: address(0),
+            value: 0,
+            data: "",
+            failed: true,
+            sourceAddress: address(0),
+            sourceRollup: 0,
+            scope: new uint256[](0)
+        });
+
+        // Get next action from execution lookup
+        bytes32 revertHash = keccak256(abi.encode(revertContinueAction));
+        return _findAndApplyExecution(revertHash);
     }
 
     /// @notice Computes the CREATE2 address for an L2Proxy

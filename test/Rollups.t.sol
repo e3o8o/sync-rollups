@@ -198,7 +198,8 @@ contract RollupsTest is Test {
             data: callData,
             failed: false,
             sourceAddress: proxyAddr,
-            sourceRollup: rollupId
+            sourceRollup: rollupId,
+            scope: new uint256[](0)
         });
 
         Action memory nextAction = Action({
@@ -209,7 +210,8 @@ contract RollupsTest is Test {
             data: "",
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Create state deltas array
@@ -328,7 +330,8 @@ contract RollupsTest is Test {
             data: callData,
             failed: false,
             sourceAddress: proxyAddr,
-            sourceRollup: rollupId
+            sourceRollup: rollupId,
+            scope: new uint256[](0)
         });
 
         Action memory nextAction = Action({
@@ -339,7 +342,8 @@ contract RollupsTest is Test {
             data: "",
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Create state deltas array
@@ -395,7 +399,8 @@ contract RollupsTest is Test {
             data: callData,
             failed: false,
             sourceAddress: proxyAddr,
-            sourceRollup: rollupId
+            sourceRollup: rollupId,
+            scope: new uint256[](0)
         });
 
         Action memory nextAction = Action({
@@ -406,7 +411,8 @@ contract RollupsTest is Test {
             data: "",
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Create state deltas array
@@ -477,7 +483,8 @@ contract RollupsTest is Test {
             data: callData,
             failed: false,
             sourceAddress: proxyAddr,
-            sourceRollup: rollupId
+            sourceRollup: rollupId,
+            scope: new uint256[](0)
         });
 
         // Next action after first CALL: another CALL to setValue(200)
@@ -489,7 +496,8 @@ contract RollupsTest is Test {
             data: abi.encodeCall(TestTarget.setValue, (200)),
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Result action from the second CALL (setValue returns nothing, so empty data)
@@ -501,7 +509,8 @@ contract RollupsTest is Test {
             data: "",
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // Final result action
@@ -513,7 +522,8 @@ contract RollupsTest is Test {
             data: "",
             failed: false,
             sourceAddress: address(0),
-            sourceRollup: 0
+            sourceRollup: 0,
+            scope: new uint256[](0)
         });
 
         // State deltas for first execution

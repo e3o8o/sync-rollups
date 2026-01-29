@@ -98,7 +98,8 @@ contract L2Proxy {
             data: msg.data,
             failed: false,
             sourceAddress: address(this),
-            sourceRollup: rollupId
+            sourceRollup: rollupId,
+            scope: new uint256[](0)
         });
 
         // Compute action hash
@@ -117,7 +118,7 @@ contract L2Proxy {
     receive() external payable {}
 
     /// @notice Executes a call on behalf of another authorized proxy
-    /// @dev Only callable by other authorized proxies
+    /// @dev Only callable by the Rollups contract or other authorized proxies
     /// @param destination The address to call
     /// @param data The calldata
     /// @return success Whether the call succeeded
@@ -128,8 +129,8 @@ contract L2Proxy {
     ) external payable returns (bool success, bytes memory returnData) {
         Rollups rollupsContract = _getRollups();
 
-        // Only authorized proxies can call this
-        if (!rollupsContract.authorizedProxies(msg.sender)) {
+        // Only Rollups contract or authorized proxies can call this
+        if (msg.sender != address(rollupsContract) && !rollupsContract.authorizedProxies(msg.sender)) {
             revert Unauthorized();
         }
 
@@ -137,62 +138,50 @@ contract L2Proxy {
         (success, returnData) = destination.call{value: msg.value}(data);
     }
 
+    /// @notice Decodes the nextAction from ScopeReverted error data
+    /// @dev At root level, state restoration is not needed (handled by Rollups contract)
+    /// @param revertData The raw revert data (includes 4-byte selector)
+    /// @return nextAction The decoded action
+    function _decodeScopeRevert(bytes memory revertData) private pure returns (Action memory nextAction) {
+        // Skip 4-byte selector, decode parameters
+        require(revertData.length > 4, "Invalid revert data");
+        bytes memory withoutSelector = new bytes(revertData.length - 4);
+        for (uint256 i = 4; i < revertData.length; i++) {
+            withoutSelector[i - 4] = revertData[i];
+        }
+        // Decode: (bytes nextAction, bytes32 stateRoot, uint256 rollupId)
+        // State restoration is handled by Rollups._handleScopeRevert, not needed here at root
+        (bytes memory actionBytes,,) = abi.decode(withoutSelector, (bytes, bytes32, uint256));
+        return abi.decode(actionBytes, (Action));
+    }
+
     /// @notice Internal function to execute an L2 action through the Rollups contract
     /// @param actionHash The action hash to execute
     /// @param rollupsContract The Rollups contract instance
-    /// @param rollupId The rollup ID for ETH withdrawals
+    /// @param rollupId The rollup ID (unused, kept for interface compatibility)
     /// @return result The result of the execution
     function _execute(bytes32 actionHash, Rollups rollupsContract, uint256 rollupId) private returns (bytes memory result) {
-        bytes32 currentActionHash = actionHash;
+        rollupId; // Silence unused variable warning
 
-        while (true) {
-            Action memory nextAction = rollupsContract.executeL2Execution(currentActionHash);
+        // Get first action
+        Action memory nextAction = rollupsContract.executeL2Execution(actionHash);
 
-            if (nextAction.actionType == ActionType.CALL) {
-                // Compute source proxy address
-                address sourceProxy = rollupsContract.computeL2ProxyAddress(
-                    nextAction.sourceAddress,
-                    nextAction.sourceRollup,
-                    block.chainid
-                );
-
-                // Create source proxy if it doesn't exist
-                if (!rollupsContract.authorizedProxies(sourceProxy)) {
-                    rollupsContract.createL2ProxyContract(nextAction.sourceAddress, nextAction.sourceRollup);
-                }
-
-                // Withdraw ETH from rollup if needed for the call
-                if (nextAction.value > 0) {
-                    rollupsContract.withdrawEther(rollupId, nextAction.value);
-                }
-
-                // Execute the call through the source proxy
-                (bool success, bytes memory returnData) = L2Proxy(payable(sourceProxy)).executeOnBehalf{value: nextAction.value}(
-                    nextAction.destination,
-                    nextAction.data
-                );
-
-                // Build RESULT action from the call result
-                Action memory resultAction = Action({
-                    actionType: ActionType.RESULT,
-                    rollupId: nextAction.rollupId,
-                    destination: address(0),
-                    value: 0,
-                    data: returnData,
-                    failed: !success,
-                    sourceAddress: address(0),
-                    sourceRollup: 0
-                });
-
-                // Compute new action hash and continue the loop
-                currentActionHash = keccak256(abi.encode(resultAction));
-            } else {
-                // RESULT type - return the data or revert if failed
-                if (nextAction.failed) {
-                    revert CallExecutionFailed();
-                }
-                return nextAction.data;
+        if (nextAction.actionType == ActionType.CALL) {
+            // Delegate all scope handling to Rollups.newScope with try/catch for reverts
+            // Start with empty scope, action.scope contains target
+            uint256[] memory emptyScope = new uint256[](0);
+            try rollupsContract.newScope(emptyScope, nextAction) returns (Action memory retAction) {
+                nextAction = retAction;
+            } catch (bytes memory revertData) {
+                // Root scope caught a revert - decode and continue
+                nextAction = _decodeScopeRevert(revertData);
             }
         }
+
+        // At this point nextAction should be a successful RESULT
+        if (nextAction.actionType != ActionType.RESULT || nextAction.failed) {
+            revert CallExecutionFailed();
+        }
+        return nextAction.data;
     }
 }
